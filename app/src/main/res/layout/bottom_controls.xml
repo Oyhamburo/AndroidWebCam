@@ -16,13 +16,27 @@
             android:layout_height="wrap_content"
             android:text="Micrófono" />
 
-        <!-- Cambiar cámara (se mantiene inmediato; si querés lo pasamos a diferido también) -->
-        <Button
-            android:id="@+id/btnSwitchCam"
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swFollowOrientation"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Cambiar cámara"
+            android:text="Ajustar receptor según orientación del teléfono"
             android:layout_marginTop="12dp" />
+
+        <!-- Cámara: listado de TODAS las cámaras físicas -->
+        <TextView
+            android:id="@+id/tvCameraLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Cámara"
+            android:textStyle="bold"
+            android:layout_marginTop="16dp" />
+
+        <Spinner
+            android:id="@+id/spCamera"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" />
 
         <!-- Aspecto -->
         <TextView
@@ -65,7 +79,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:max="10000"
+            android:max="20000"
             android:min="300" />
 
         <!-- Aplicar -->
