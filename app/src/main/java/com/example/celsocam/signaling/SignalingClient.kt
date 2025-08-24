@@ -2,16 +2,17 @@ package com.example.celsocam.signaling
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import okhttp3.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
-// ICE remoto
+private const val TAG = "Signaling"
+
 data class RemoteIce(val candidate: String, val sdpMid: String?, val sdpMLineIndex: Int)
 
-// Config que llega del servidor (incluye cameraName opcional)
 data class ConfigState(
     val micEnabled: Boolean,
     val width: Int,
@@ -19,22 +20,12 @@ data class ConfigState(
     val fps: Int,
     val bitrateKbps: Int,
     val aspect: String,
-    val camera: String,           // "back" | "front" (fallback)
-    val cameraName: String?       // deviceName exacto si viene (ej: "0","1","3")
+    val camera: String,           // "back" | "front"
+    val cameraName: String?       // deviceName exacto si viene
 )
 
-// ----- Tipos para enviar capacidades (/api/caps) -----
-data class CamInfo(
-    val name: String,             // deviceName real de WebRTC (p.ej. "0","1")
-    val label: String,            // texto para mostrar (ej: "Trasera 0 (0)")
-    val facing: String            // "front" | "back" | "other"
-)
-
-data class FormatCaps(
-    val w: Int,
-    val h: Int,
-    val fps: List<Int>            // lista de FPS soportados para ese WxH
-)
+data class CamInfo(val name: String, val label: String, val facing: String)
+data class FormatCaps(val w: Int, val h: Int, val fps: List<Int>)
 
 class SignalingClient(
     private var url: String,
@@ -49,12 +40,13 @@ class SignalingClient(
     private val onClosed: () -> Unit = {},
     private val onReconnecting: (Int, Long) -> Unit = { _, _ -> },
     private val onFailureCb: (Throwable) -> Unit = {},
+    private val onRequestCaps: () -> Unit = {},
+    private val onReconnected: () -> Unit = {},     // <— NUEVO callback
     private val autoConnect: Boolean = true
 ) {
     private var ws: WebSocket? = null
     private val main = Handler(Looper.getMainLooper())
 
-    // Backoff reconexión
     private var reconnectAttempts = 0
     private val baseDelayMs = 1500L
     private val maxDelayMs = 30_000L
@@ -69,16 +61,22 @@ class SignalingClient(
         override fun onOpen(webSocket: WebSocket, response: Response) {
             isConnected = true
             reconnectAttempts = 0
-            // Identificarnos
+            Log.i(TAG, "WS OPEN -> $url")
+            // Identificar rol
             send(JSONObject(mapOf("role" to "android")))
             post { onOpen() }
+            // Avisar que la conexión quedó nuevamente abierta (para renegociar)
+            post { onReconnected() }
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
+            val msg = runCatching { JSONObject(text) }.getOrNull() ?: run {
+                Log.w(TAG, "WS MESSAGE no-JSON: ${text.take(200)}")
+                return
+            }
             when (msg.optString("type")) {
-                "browser-ready" -> post { onBrowserReady() }
-                "answer" -> post { onAnswer(msg.optString("sdp")) }
+                "browser-ready" -> { Log.d(TAG, "WS <- browser-ready"); post { onBrowserReady() } }
+                "answer" -> { Log.d(TAG, "WS <- answer (${text.length}b)"); post { onAnswer(msg.optString("sdp")) } }
                 "ice" -> post {
                     onIceFromRemote(
                         RemoteIce(
@@ -97,24 +95,27 @@ class SignalingClient(
                         bitrateKbps  = msg.optInt("bitrateKbps", 6000),
                         aspect       = msg.optString("aspect", "AUTO_MAX"),
                         camera       = msg.optString("camera", "back"),
-                        cameraName   = msg.optString("cameraName", null)
-                            ?.takeIf { it.isNotEmpty() && it != "null" }
+                        cameraName   = msg.optString("cameraName", null)?.takeIf { it.isNotEmpty() && it != "null" }
                     )
+                    Log.d(TAG, "WS <- config: $cfg")
                     post { onConfig(cfg) }
                 }
-                "ping" -> { /* opcional: responder pong */ }
-                "pong" -> { /* noop */ }
+                "request-caps" -> { Log.d(TAG, "WS <- request-caps"); post { onRequestCaps() } }
+                "ping", "pong" -> {}
+                else -> Log.d(TAG, "WS <- ${msg.optString("type")} (${text.length}b)")
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             isConnected = false
+            Log.w(TAG, "WS CLOSED code=$code reason=${reason.take(200)}")
             post { onClosed() }
             scheduleReconnect()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             isConnected = false
+            Log.e(TAG, "WS FAILURE url=$url err=${t.message} respCode=${response?.code}", t)
             post { onFailureCb(t) }
             scheduleReconnect()
         }
@@ -124,20 +125,27 @@ class SignalingClient(
         if (autoConnect) connect()
     }
 
-    // ---------- Conexión pública ----------
     @Synchronized
     fun connect() {
         cancelScheduledReconnect()
+        Log.i(TAG, "WS CONNECT -> $url")
         val req = Request.Builder().url(url).build()
-        ws = httpClient.newWebSocket(req, wsListener)
+        ws = try {
+            httpClient.newWebSocket(req, wsListener)
+        } catch (t: Throwable) {
+            Log.e(TAG, "WS CONNECT THROW: ${t.message}", t)
+            null
+        }
     }
 
     fun updateUrl(newUrl: String, reconnect: Boolean = true) {
+        Log.i(TAG, "WS URL UPDATE $url -> $newUrl")
         url = newUrl
         if (reconnect) reconnectNow()
     }
 
     fun reconnectNow() {
+        Log.i(TAG, "WS RECONNECT NOW")
         reconnectAttempts = 0
         close()
         connect()
@@ -146,6 +154,7 @@ class SignalingClient(
     private fun scheduleReconnect() {
         reconnectAttempts += 1
         val delay = min(maxDelayMs, baseDelayMs * (1 shl (reconnectAttempts - 1)))
+        Log.w(TAG, "WS RECONNECT in ${delay}ms (attempt #$reconnectAttempts)")
         post { onReconnecting(reconnectAttempts, delay) }
         cancelScheduledReconnect()
         val r = Runnable { connect() }
@@ -168,27 +177,12 @@ class SignalingClient(
     }
 
     fun sendIce(candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
-        send(
-            JSONObject(
-                mapOf(
-                    "type" to "ice",
-                    "candidate" to candidate,
-                    "sdpMid" to sdpMid,
-                    "sdpMLineIndex" to sdpMLineIndex
-                )
-            )
-        )
+        send(JSONObject(mapOf("type" to "ice", "candidate" to candidate, "sdpMid" to sdpMid, "sdpMLineIndex" to sdpMLineIndex)))
     }
 
     fun ping() = send(JSONObject(mapOf("type" to "ping")))
 
-    /**
-     * Enviar capacidades del dispositivo (para que /api/caps liste TODAS las cámaras y formatos).
-     *
-     * @param cameras lista de cámaras físicas
-     * @param formatsByCameraName mapa: deviceName -> lista de formatos con FPS soportados
-     * @param supportedAspects lista de aspectos soportados (opcional). Ej: ["AUTO_MAX","R16_9","R4_3","R1_1"]
-     */
+    /** Publica capacidades del dispositivo al servidor */
     fun sendCaps(
         cameras: List<CamInfo>,
         formatsByCameraName: Map<String, List<FormatCaps>>,
@@ -196,32 +190,21 @@ class SignalingClient(
     ) {
         val camsJson = JSONArray().apply {
             cameras.forEach { c ->
-                put(
-                    JSONObject().apply {
-                        put("name", c.name)
-                        put("label", c.label)
-                        put("facing", c.facing)
-                    }
-                )
+                put(JSONObject().apply {
+                    put("name", c.name); put("label", c.label); put("facing", c.facing)
+                })
             }
         }
 
         val formatsJson = JSONObject().apply {
             formatsByCameraName.forEach { (camName, list) ->
-                put(
-                    camName,
-                    JSONArray().apply {
-                        list.forEach { f ->
-                            put(
-                                JSONObject().apply {
-                                    put("w", f.w)
-                                    put("h", f.h)
-                                    put("fps", JSONArray(f.fps))
-                                }
-                            )
-                        }
+                put(camName, JSONArray().apply {
+                    list.forEach { f ->
+                        put(JSONObject().apply {
+                            put("w", f.w); put("h", f.h); put("fps", JSONArray(f.fps))
+                        })
                     }
-                )
+                })
             }
         }
 
@@ -231,18 +214,28 @@ class SignalingClient(
             put("formatsByCameraName", formatsJson)
             supportedAspects?.let { put("supportedAspects", JSONArray(it)) }
         }
-
+        Log.d(TAG, "WS -> caps (cameras=${cameras.size})")
         send(obj)
     }
 
-    // ---------- Utilidades ----------
     private fun send(obj: JSONObject) {
-        ws?.send(obj.toString())
+        val s = obj.toString()
+        val socket = ws
+        if (socket == null) {
+            Log.w(TAG, "WS SEND skip (socket null): ${s.take(120)}")
+            return
+        }
+        try {
+            socket.send(s)
+            Log.v(TAG, "WS -> ${obj.optString("type")} (${s.length}b)")
+        } catch (t: Throwable) {
+            Log.e(TAG, "WS SEND error: ${t.message}", t)
+        }
     }
 
     fun close() {
         cancelScheduledReconnect()
-        ws?.close(1000, null)
+        try { ws?.close(1000, null) } catch (_: Throwable) {}
         ws = null
         isConnected = false
     }
