@@ -13,6 +13,12 @@ private const val TAG = "Signaling"
 
 data class RemoteIce(val candidate: String, val sdpMid: String?, val sdpMLineIndex: Int)
 
+data class IceServer(
+    val urls: List<String>,
+    val username: String? = null,
+    val credential: String? = null
+)
+
 data class ConfigState(
     val micEnabled: Boolean,
     val width: Int,
@@ -21,7 +27,8 @@ data class ConfigState(
     val bitrateKbps: Int,
     val aspect: String,
     val camera: String,           // "back" | "front"
-    val cameraName: String?       // deviceName exacto si viene
+    val cameraName: String?,      // deviceName exacto si viene
+    val iceServers: List<IceServer> // <— NUEVO
 )
 
 data class CamInfo(val name: String, val label: String, val facing: String)
@@ -41,7 +48,7 @@ class SignalingClient(
     private val onReconnecting: (Int, Long) -> Unit = { _, _ -> },
     private val onFailureCb: (Throwable) -> Unit = {},
     private val onRequestCaps: () -> Unit = {},
-    private val onReconnected: () -> Unit = {},     // <— NUEVO callback
+    private val onReconnected: () -> Unit = {},
     private val autoConnect: Boolean = true
 ) {
     private var ws: WebSocket? = null
@@ -57,15 +64,32 @@ class SignalingClient(
 
     private fun post(block: () -> Unit) = main.post(block)
 
+    private fun parseIceServers(from: JSONObject): List<IceServer> {
+        val arr = from.optJSONArray("iceServers") ?: return emptyList()
+        val out = mutableListOf<IceServer>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val urlsJson = o.opt("urls")
+            val urls = when (urlsJson) {
+                is JSONArray -> (0 until urlsJson.length()).mapNotNull { urlsJson.optString(it, null) }.filter { it?.isNotBlank() == true }
+                is String -> listOf(urlsJson)
+                else -> emptyList()
+            }
+            if (urls.isEmpty()) continue
+            val user = o.optString("username", null)?.takeIf { it.isNotEmpty() }
+            val cred = o.optString("credential", null)?.takeIf { it.isNotEmpty() }
+            out += IceServer(urls = urls, username = user, credential = cred)
+        }
+        return out
+    }
+
     private val wsListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             isConnected = true
             reconnectAttempts = 0
             Log.i(TAG, "WS OPEN -> $url")
-            // Identificar rol
             send(JSONObject(mapOf("role" to "android")))
             post { onOpen() }
-            // Avisar que la conexión quedó nuevamente abierta (para renegociar)
             post { onReconnected() }
         }
 
@@ -95,9 +119,10 @@ class SignalingClient(
                         bitrateKbps  = msg.optInt("bitrateKbps", 6000),
                         aspect       = msg.optString("aspect", "AUTO_MAX"),
                         camera       = msg.optString("camera", "back"),
-                        cameraName   = msg.optString("cameraName", null)?.takeIf { it.isNotEmpty() && it != "null" }
+                        cameraName   = msg.optString("cameraName", null)?.takeIf { it.isNotEmpty() && it != "null" },
+                        iceServers   = parseIceServers(msg)
                     )
-                    Log.d(TAG, "WS <- config: $cfg")
+                    Log.d(TAG, "WS <- config: width=${cfg.width} height=${cfg.height} fps=${cfg.fps} br=${cfg.bitrateKbps} ice=${cfg.iceServers.size}")
                     post { onConfig(cfg) }
                 }
                 "request-caps" -> { Log.d(TAG, "WS <- request-caps"); post { onRequestCaps() } }
@@ -153,7 +178,7 @@ class SignalingClient(
 
     private fun scheduleReconnect() {
         reconnectAttempts += 1
-        val delay = min(maxDelayMs, baseDelayMs * (1 shl (reconnectAttempts - 1)))
+        val delay = kotlin.math.min(maxDelayMs, baseDelayMs * (1 shl (reconnectAttempts - 1)))
         Log.w(TAG, "WS RECONNECT in ${delay}ms (attempt #$reconnectAttempts)")
         post { onReconnecting(reconnectAttempts, delay) }
         cancelScheduledReconnect()
@@ -182,7 +207,6 @@ class SignalingClient(
 
     fun ping() = send(JSONObject(mapOf("type" to "ping")))
 
-    /** Publica capacidades del dispositivo al servidor */
     fun sendCaps(
         cameras: List<CamInfo>,
         formatsByCameraName: Map<String, List<FormatCaps>>,

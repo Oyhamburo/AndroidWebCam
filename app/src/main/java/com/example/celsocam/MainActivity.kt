@@ -16,30 +16,28 @@ import androidx.core.content.ContextCompat
 import com.example.celsocam.signaling.SignalingClient
 import com.example.celsocam.ui.ControlsSheet
 import com.example.celsocam.util.OrientationHelper
-import com.example.celsocam.util.NetworkBinder
 import com.example.celsocam.webrtc.WebRtcController
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.webrtc.SurfaceViewRenderer
 
 class MainActivity : AppCompatActivity() {
 
-    private val HOST_IP = "192.168.0.53" // <-- tu IP LAN
-    private val WS_URL: String = "ws://$HOST_IP:8080"
-    private val HTTP_URL: String = "http://$HOST_IP:8080/api/config"
+    private val WS_URL: String = "ws://192.168.0.53:8080" // ⚠️ Ajustá la IP según tu server
 
+    // UI
     private lateinit var localView: SurfaceViewRenderer
     private lateinit var btnControls: Button
     private lateinit var btnReconnect: Button
 
+    // Permisos
     private lateinit var cameraPermsLauncher: ActivityResultLauncher<Array<String>>
     private lateinit var micPermLauncher: ActivityResultLauncher<String>
 
+    // Infra
     private lateinit var httpClient: OkHttpClient
     private lateinit var signaling: SignalingClient
     private lateinit var webrtc: WebRtcController
     private lateinit var orientationHelper: OrientationHelper
-    private lateinit var networkBinder: NetworkBinder
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,10 +49,8 @@ class MainActivity : AppCompatActivity() {
         btnReconnect = findViewById(R.id.btnReconnect)
 
         httpClient = OkHttpClient()
-        networkBinder = NetworkBinder(this)
 
-
-        // 2) Signaling (NO autoConnect) con onReconnected -> resetPeer + offer
+        // 1) Crear SignalingClient (sin autoconectar; conectamos cuando la cam esté lista)
         signaling = SignalingClient(
             url = WS_URL,
             httpClient = httpClient,
@@ -62,20 +58,26 @@ class MainActivity : AppCompatActivity() {
             onIceFromRemote = { cand -> webrtc.addRemoteIce(cand) },
             onBrowserReady = { webrtc.createOffer() },
             onConfig = { cfg -> webrtc.applyConfig(cfg) },
-            onOpen = { toast("WS conectado a $WS_URL") },
-            onClosed = { toast("WS cerrado") },
-            onReconnecting = { _, _ -> },
-            onFailureCb = { err -> toast("WS FAILURE: ${err.message}") },
-            onRequestCaps = { webrtc.sendCapsNow() },
+            onOpen = { runOnUiThread { toast("WS conectado") } },
+            onClosed = { runOnUiThread { toast("WS cerrado") } },
+            onReconnecting = { attempt, delayMs ->
+                runOnUiThread { toast("WS reconectando (#$attempt) en ${delayMs}ms") }
+            },
+            onFailureCb = { t ->
+                runOnUiThread { toast("WS error: ${t.message}") }
+            },
+            onRequestCaps = {
+                // El server pidió capacidades -> publicarlas
+                webrtc.sendCapsNow()
+            },
             onReconnected = {
-                // 🔑 cuando el WS vuelve a abrir, reseteamos y renegociamos
-                webrtc.resetPeer()
-                webrtc.createOffer()
+                // El WS volvió a abrir: renegociar con el peer actual
+                webrtc.ensureSignalingAndOffer()
             },
             autoConnect = false
         )
 
-        // reasignar el signaling real al controlador (el de arriba era placeholder)
+        // 2) WebRTC puede depender de signaling
         webrtc = WebRtcController(
             context = this,
             localRenderer = localView,
@@ -86,7 +88,9 @@ class MainActivity : AppCompatActivity() {
         orientationHelper = OrientationHelper(
             context = this,
             followDeviceOrientation = true,
-            onOrientationLabel = { label -> signaling.sendOrientation(label) }
+            onOrientationLabel = { label ->
+                signaling.sendOrientation(label)
+            }
         )
 
         // 4) Permisos
@@ -95,7 +99,10 @@ class MainActivity : AppCompatActivity() {
         ) { result ->
             val camGranted = result[Manifest.permission.CAMERA] == true
             if (camGranted) {
-                startAndConnect()
+                webrtc.initAndStart()
+                orientationHelper.enable()
+                // Conecta/renegocia ahora que la cámara está lista
+                signaling.reconnectNow()
             } else {
                 val showCam = shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)
                 if (!showCam) {
@@ -112,8 +119,12 @@ class MainActivity : AppCompatActivity() {
         micPermLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { granted ->
-            if (granted) webrtc.setMicEnabled(true)
-            else { webrtc.setMicEnabled(false); toast("Permiso de Micrófono denegado") }
+            if (granted) {
+                webrtc.setMicEnabled(true)
+            } else {
+                webrtc.setMicEnabled(false)
+                toast("Permiso de Micrófono denegado")
+            }
         }
 
         // 5) Controles
@@ -126,42 +137,30 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // 6) Reconectar manual
+        // 6) Botón Reconectar manual
         btnReconnect.setOnClickListener {
             toast("Reconectando…")
-            val bound = networkBinder.bindWifiIfPresent()
-            if (!bound) toast("Wi-Fi no disponible (¿VPN/Guest?)")
             signaling.reconnectNow()
             webrtc.ensureSignalingAndOffer()
-            httpPing()
         }
 
-        // 7) Arranque
+        // 7) Arranque: pedir cámara o iniciar y conectar
         val camPermGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
                 PackageManager.PERMISSION_GRANTED
-        if (camPermGranted) startAndConnect() else {
+        if (camPermGranted) {
+            webrtc.initAndStart()
+            orientationHelper.enable()
+            // conectamos cuando todo está listo (cámara inicializada)
+            signaling.reconnectNow()
+        } else {
             cameraPermsLauncher.launch(arrayOf(Manifest.permission.CAMERA))
         }
-    }
-
-    private fun startAndConnect() {
-        webrtc.initAndStart()
-        orientationHelper.enable()
-        val bound = networkBinder.bindWifiIfPresent()
-        if (bound) toast("Usando red Wi-Fi para señalización") else toast("No se encontró Wi-Fi (¿VPN/Guest?)")
-        signaling.reconnectNow()
-        httpPing()
     }
 
     override fun onResume() {
         super.onResume()
         orientationHelper.enable()
         webrtc.tryResumeCapture()
-        if (!signaling.isConnected) {
-            networkBinder.bindWifiIfPresent()
-            signaling.connect()
-            httpPing()
-        }
     }
 
     override fun onPause() {
@@ -175,18 +174,8 @@ class MainActivity : AppCompatActivity() {
         orientationHelper.shutdown()
         webrtc.releaseAll()
         signaling.close()
-        // networkBinder.unbind() opcional
     }
 
     private fun toast(msg: String) =
-        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-
-    private fun httpPing() {
-        Thread {
-            try {
-                val r = httpClient.newCall(Request.Builder().url(HTTP_URL).build()).execute()
-                toast("HTTP OK ${r.code} /api/config"); r.close()
-            } catch (t: Throwable) { toast("HTTP FAIL: ${t.message}") }
-        }.start()
-    }
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 }

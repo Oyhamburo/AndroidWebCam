@@ -2,13 +2,13 @@ package com.example.celsocam.webrtc
 
 import android.content.Context
 import android.widget.Toast
+import com.example.celsocam.signaling.CamInfo
 import com.example.celsocam.signaling.ConfigState
+import com.example.celsocam.signaling.FormatCaps
 import com.example.celsocam.signaling.RemoteIce
 import com.example.celsocam.signaling.SignalingClient
 import org.webrtc.*
 import kotlin.math.abs
-import com.example.celsocam.signaling.CamInfo
-import com.example.celsocam.signaling.FormatCaps
 
 class WebRtcController(
     private val context: Context,
@@ -60,14 +60,10 @@ class WebRtcController(
     var currentAspect: Aspect = Aspect.AUTO_MAX
         private set
 
-    // ---- Estado de inicialización / pending config ----
-    private var isInitialized = false
-    private var pendingConfig: ConfigState? = null
-
-    /** Public: permite responder a "request-caps" del server */
+    /** Public: responder a "request-caps" del server */
     fun sendCapsNow() = publishCaps()
 
-    /** Publicamos capacidades hacia el servidor vía Signaling */
+    // ---------- Publicar capacidades ----------
     private fun publishCaps() {
         val e = cameraEnumerator ?: return
 
@@ -86,17 +82,13 @@ class WebRtcController(
                 "front" -> "Frontal ${frontIdx++} ($name)"
                 else    -> "Otra ($name)"
             }
-            cams += CamInfo(
-                name = name,
-                label = label,
-                facing = facing
-            )
+            cams += CamInfo(name = name, label = label, facing = facing)
         }
 
-        // 2) Formatos por cámara
+        // 2) Formatos por cámara (con lista realista de FPS)
         val formatsByName = mutableMapOf<String, List<FormatCaps>>()
         for (name in e.deviceNames) {
-            val fmts = getSupportedFormats(name)
+            val fmts = getSupportedFormats(name) // List<Format> con varios fps por resolución
             val listForCam: List<FormatCaps> = fmts
                 .groupBy { it.w to it.h }
                 .map { (wh, list) ->
@@ -135,6 +127,7 @@ class WebRtcController(
         cameraEnumerator = if (Camera2Enumerator.isSupported(context))
             Camera2Enumerator(context) else Camera1Enumerator(false)
 
+        // Selección por defecto
         val e = cameraEnumerator!!
         val names = e.deviceNames
         selectedCameraName = names.firstOrNull { runCatching { e.isBackFacing(it) }.getOrDefault(false) }
@@ -152,7 +145,7 @@ class WebRtcController(
         val helper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
         videoSource = factory.createVideoSource(false)
         capturer!!.initialize(helper, context, videoSource!!.capturerObserver)
-        try { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) } catch (_: Exception) {}
+        runCatching { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) }
 
         videoTrack = factory.createVideoTrack("VID", videoSource)
 
@@ -161,16 +154,35 @@ class WebRtcController(
         localRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         videoTrack!!.addSink(localRenderer)
 
-        createOrResetPeer() // crea peer y agrega tracks
+        val iceServers = listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
+        peer = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
+            override fun onIceCandidate(c: IceCandidate) { signaling.sendIce(c.sdp, c.sdpMid, c.sdpMLineIndex) }
+            override fun onSignalingChange(p0: PeerConnection.SignalingState) {}
+            override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState) {}
+            override fun onIceConnectionReceivingChange(p0: Boolean) {}
+            override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState) {}
+            override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
+            override fun onAddStream(p0: MediaStream?) {}
+            override fun onRemoveStream(p0: MediaStream?) {}
+            override fun onDataChannel(p0: DataChannel?) {}
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
+            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {}
+        })
+
+        // Sender de video (no eliminarlo más adelante)
+        videoSender = peer?.addTrack(videoTrack, listOf(STREAM_ID))
+
+        // Audio se crea al habilitarse
+        audioSender = null
+        audioTrack = null
+        audioSource = null
+        isMicEnabled = false
 
         publishCaps()
-
-        isInitialized = true
-        // aplicar config que haya llegado temprano
-        pendingConfig?.let {
-            pendingConfig = null
-            applyConfig(it)
-        }
     }
 
     private fun aspectFromString(s: String?): Aspect {
@@ -207,12 +219,7 @@ class WebRtcController(
                 "front" -> "Frontal ${frontIdx++} ($n)"
                 else -> "Otra ($n)"
             }
-            CameraDevice(
-                name = n,
-                label = label,
-                facing = facing,
-                isSelected = (n == selectedCameraName)
-            )
+            CameraDevice(name = n, label = label, facing = facing, isSelected = (n == selectedCameraName))
         }
     }
 
@@ -221,7 +228,7 @@ class WebRtcController(
     fun switchToDeviceName(deviceName: String) {
         if (deviceName == selectedCameraName) return
         forceRecreateCapturer(deviceName)
-        setCurrentAspect(currentAspect) // re-aplica el mejor formato del aspecto en la nueva lente
+        setAspectLabel(currentAspect)
     }
 
     // ---------- Señalización ----------
@@ -270,29 +277,25 @@ class WebRtcController(
 
     // ---------- /config ----------
     fun applyConfig(cfg: ConfigState) {
-        // Si aún no terminamos init, guardamos y salimos
-        if (!isInitialized) {
-            pendingConfig = cfg
-            return
-        }
-
         // 1) Cámara
         if (!cfg.cameraName.isNullOrEmpty()) {
             if (cfg.cameraName != currentCameraName()) {
                 switchToDeviceName(cfg.cameraName!!)
             }
         } else {
-            switchTo(cfg.camera) // fallback back|front
+            switchTo(cfg.camera)
         }
 
-        // 2) Video
+        // 2) Video (res/fps/bitrate)
+        val resChanged = (cfg.width != currentWidth || cfg.height != currentHeight || cfg.fps != currentFps)
         applyVideoQuality(cfg.width, cfg.height, cfg.fps, cfg.bitrateKbps)
 
         // 3) Mic
         setMicEnabled(cfg.micEnabled)
 
-        // 4) Aspecto
-        setCurrentAspect(aspectFromString(cfg.aspect))
+        // 4) Aspecto: si hubo cambio de resolución, solo actualizamos etiqueta
+        if (resChanged) setAspectLabel(aspectFromString(cfg.aspect))
+        else setCurrentAspect(aspectFromString(cfg.aspect))
 
         // 5) Renegociar
         ensureSignalingAndOffer()
@@ -310,100 +313,43 @@ class WebRtcController(
             audioTrack?.setEnabled(true)
         } else {
             audioTrack?.setEnabled(false)
-            // (opcional) remover track para cortar tráfico
-            // audioSender?.let { peer?.removeTrack(it); audioSender = null }
         }
         isMicEnabled = enabled
     }
 
     // ---------- Video ----------
     fun applyVideoQuality(w: Int, h: Int, fps: Int, bitrateKbps: Int) {
-        val cam = capturer
-        if (cam is CameraVideoCapturer) {
-            try {
-                cam.changeCaptureFormat(w, h, fps)
-            } catch (_: Exception) {
-                try { cam.stopCapture() } catch (_: Exception) {}
-                try { cam.startCapture(w, h, fps) } catch (_: Exception) {
-                    Toast.makeText(context, "No se pudo aplicar ${w}x$h@$fps", Toast.LENGTH_LONG).show()
-                    return
-                }
-            }
-        } else {
-            try { capturer?.stopCapture() } catch (_: Exception) {}
-            try { capturer?.startCapture(w, h, fps) } catch (_: Exception) {
-                Toast.makeText(context, "No se pudo aplicar ${w}x$h@$fps", Toast.LENGTH_LONG).show()
-                return
-            }
+        // Cambio robusto: SIEMPRE reiniciamos la captura con los nuevos parámetros
+        val ok = restartCapture(w, h, fps)
+        if (!ok) {
+            Toast.makeText(context, "No se pudo aplicar ${w}x$h@$fps", Toast.LENGTH_LONG).show()
+            return
         }
         currentWidth = w; currentHeight = h; currentFps = fps
-
-        // Bitrate puede fallar si el sender está “disposed”; setVideoBitrateKbps ya es resiliente
         setVideoBitrateKbps(bitrateKbps)
     }
 
-    private fun applyVideoQualityInternal(w: Int, h: Int, fps: Int) {
-        val cam = capturer
-        if (cam is CameraVideoCapturer) {
-            try {
-                cam.changeCaptureFormat(w, h, fps)
-            } catch (_: Exception) {
-                try { cam.stopCapture() } catch (_: Exception) {}
-                try { cam.startCapture(w, h, fps) } catch (_: Exception) {
-                    Toast.makeText(context, "No se pudo aplicar ${w}x$h@$fps", Toast.LENGTH_LONG).show()
-                    return
-                }
-            }
-        } else {
-            try { capturer?.stopCapture() } catch (_: Exception) {}
-            try { capturer?.startCapture(w, h, fps) } catch (_: Exception) {
-                Toast.makeText(context, "No se pudo aplicar ${w}x$h@$fps", Toast.LENGTH_LONG).show()
-                return
-            }
+    private fun restartCapture(w: Int, h: Int, fps: Int): Boolean {
+        val cam = capturer as? CameraVideoCapturer ?: return false
+        val stopped = runCatching { cam.stopCapture() }.isSuccess
+        val started = runCatching { cam.startCapture(w, h, fps) }.isSuccess
+        // Si no arrancó, intentamos una segunda vez pequeña con el orden inverso (por si quedó en transición)
+        return if (started) true
+        else {
+            runCatching { cam.stopCapture() }
+            runCatching { Thread.sleep(60) }
+            runCatching { cam.startCapture(w, h, fps) }.isSuccess
         }
-        currentWidth = w; currentHeight = h; currentFps = fps
-        localRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-        localRenderer.requestLayout()
     }
 
     fun setVideoBitrateKbps(kbps: Int) {
         val desired = kbps.coerceIn(300, 20000)
         currentBitrateKbps = desired
-
-        // Buscar/Reasignar un sender válido
-        var sender: RtpSender? = peer?.senders?.firstOrNull { it.track()?.kind() == "video" }
-        if (sender == null) {
-            // Si no hay sender en el peer, intentamos agregar el track actual
-            videoTrack?.let { tr ->
-                sender = peer?.addTrack(tr, listOf(STREAM_ID))
-            }
-        }
-        if (sender == null) return
-
-        // Guardar la referencia en el campo
-        videoSender = sender
-
-        // Intentar setear parámetros, con recuperación si el sender estaba “disposed”
-        try {
-            val params = sender!!.parameters
-            if (params.encodings.isNotEmpty()) {
-                params.encodings[0].maxBitrateBps = desired * 1000
-                try { sender!!.parameters = params } catch (_: Exception) { /* ignore */ }
-            }
-        } catch (_: IllegalStateException) {
-            // RtpSender disposed → recrear
-            videoTrack?.let { tr ->
-                videoSender = peer?.addTrack(tr, listOf(STREAM_ID))
-                videoSender?.let { s2 ->
-                    runCatching {
-                        val p2 = s2.parameters
-                        if (p2.encodings.isNotEmpty()) {
-                            p2.encodings[0].maxBitrateBps = desired * 1000
-                            s2.parameters = p2
-                        }
-                    }
-                }
-            }
+        val sender = videoSender ?: return
+        val params = runCatching { sender.parameters }.getOrNull() ?: return
+        if (params.encodings.isNotEmpty()) {
+            params.encodings[0].maxBitrateBps = desired * 1000
+            runCatching { sender.parameters = params }
         }
     }
 
@@ -422,15 +368,17 @@ class WebRtcController(
                     else e.deviceNames.firstOrNull { runCatching { e.isBackFacing(it) }.getOrDefault(false) }
                         ?: e.deviceNames.firstOrNull()
                 localRenderer.setMirror(isFront)
-                setCurrentAspect(currentAspect)
+                setAspectLabel(currentAspect)
             }
             override fun onCameraSwitchError(errorDescription: String?) {
                 val target = if (isFrontSelected()) "front" else "back"
                 forceRecreateCapturer(pickCamera(target))
-                setCurrentAspect(currentAspect)
+                setAspectLabel(currentAspect)
             }
         })
     }
+
+    fun setAspectLabel(a: Aspect) { currentAspect = a }
 
     fun setCurrentAspect(a: Aspect) {
         currentAspect = a
@@ -478,15 +426,15 @@ class WebRtcController(
         val targetName = pickCamera(which)
         if (targetName == selectedCameraName) return
         forceRecreateCapturer(targetName)
-        setCurrentAspect(currentAspect)
+        setAspectLabel(currentAspect)
     }
 
     private fun forceRecreateCapturer(targetName: String) {
         // Parar capturer actual
-        try { (capturer as? CameraVideoCapturer)?.stopCapture() } catch (_: Exception) {}
+        runCatching { (capturer as? CameraVideoCapturer)?.stopCapture() }
         videoTrack?.removeSink(localRenderer)
 
-        // Crear capturer nuevo
+        // Crear capturer NUEVO con ese deviceName exacto
         val e = cameraEnumerator!!
         capturer = e.createCapturer(targetName, null)
         val helper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
@@ -495,41 +443,48 @@ class WebRtcController(
         videoSource?.dispose()
         videoSource = factory.createVideoSource(false)
         capturer!!.initialize(helper, context, videoSource!!.capturerObserver)
-        try { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) } catch (_: Exception) {}
+        runCatching { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) }
 
-        // Re-crear track y reemplazar en sender existente
+        // Re-crear track y REEMPLAZAR en el sender existente
         videoTrack?.dispose()
         videoTrack = factory.createVideoTrack("VID", videoSource)
         videoTrack!!.addSink(localRenderer)
 
-        val s = ensureVideoSender()
-        if (s == null) {
-            // no había sender -> agregamos
+        if (videoSender == null) {
             videoSender = peer?.addTrack(videoTrack, listOf(STREAM_ID))
         } else {
-            // reemplazo “en caliente”; si falla, agregamos otro sender
-            val ok = runCatching { s.setTrack(videoTrack, true) }.isSuccess
-            if (!ok) {
-                videoSender = peer?.addTrack(videoTrack, listOf(STREAM_ID))
-            }
+            runCatching { videoSender?.setTrack(videoTrack, true) }
         }
 
         selectedCameraName = targetName
         publishCaps()
     }
 
+    // Devuelve múltiples FPS por resolución (Camera2)
     private fun getSupportedFormats(cameraName: String): List<Format> {
         return try {
             when (val e = cameraEnumerator) {
                 is Camera2Enumerator -> {
                     val list = e.getSupportedFormats(cameraName) ?: emptyList()
-                    list.map {
-                        val fps = it.framerate.max / 1000
-                        Format(it.width, it.height, fps)
+                    val typical = listOf(24, 25, 30, 48, 50, 60, 120)
+                    val out = ArrayList<Format>()
+                    for (f in list) {
+                        val minFps = f.framerate.min / 1000
+                        val maxFps = f.framerate.max / 1000
+                        val fpsCandidates = typical.filter { it in minFps..maxFps }.ifEmpty { listOf(maxFps) }
+                        fpsCandidates.forEach { fr ->
+                            out += Format(f.width, f.height, fr)
+                        }
                     }
+                    out
                 }
                 is Camera1Enumerator -> {
-                    listOf(1920 to 1080, 1280 to 720, 640 to 480).map { Format(it.first, it.second, 30) }
+                    // Camera1 no expone rangos por formato; devolvemos lo clásico.
+                    listOf(
+                        Format(1920, 1080, 30),
+                        Format(1280, 720, 30),
+                        Format(640, 480, 30)
+                    )
                 }
                 else -> listOf(Format(1280, 720, 30))
             }
@@ -572,63 +527,16 @@ class WebRtcController(
     }
 
     // ---------- Ciclo de vida ----------
-    fun tryPauseCapture() { try { (capturer as? CameraVideoCapturer)?.stopCapture() } catch (_: Exception) {} }
-    fun tryResumeCapture() { try { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) } catch (_: Exception) {} }
+    fun tryPauseCapture() { runCatching { (capturer as? CameraVideoCapturer)?.stopCapture() } }
+    fun tryResumeCapture() { runCatching { (capturer as? CameraVideoCapturer)?.startCapture(currentWidth, currentHeight, currentFps) } }
 
     fun releaseAll() {
-        try { (capturer as? CameraVideoCapturer)?.stopCapture() } catch (_: Exception) {}
+        runCatching { (capturer as? CameraVideoCapturer)?.stopCapture() }
         videoTrack?.dispose(); videoSource?.dispose()
         audioTrack?.dispose(); audioSource?.dispose()
         peer?.close(); peer = null
         localRenderer.release()
         factory.dispose()
         eglBase.release()
-        isInitialized = false
-        pendingConfig = null
-    }
-
-    // ---------- Peer ----------
-    /** Crea o recrea el PeerConnection y agrega los tracks actuales. */
-    private fun createOrResetPeer() {
-        try { peer?.close() } catch (_: Exception) {}
-        peer = null
-
-        val iceServers = listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
-            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-        }
-        peer = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-            override fun onIceCandidate(c: IceCandidate) { signaling.sendIce(c.sdp, c.sdpMid, c.sdpMLineIndex) }
-            override fun onSignalingChange(p0: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState) {}
-            override fun onIceConnectionReceivingChange(p0: Boolean) {}
-            override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState) {}
-            override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
-            override fun onAddStream(p0: MediaStream?) {}
-            override fun onRemoveStream(p0: MediaStream?) {}
-            override fun onDataChannel(p0: DataChannel?) {}
-            override fun onRenegotiationNeeded() {}
-            override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
-            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {}
-        })
-
-        // Reagregar tracks actuales
-        videoTrack?.let { peer?.addTrack(it, listOf(STREAM_ID)) }
-        audioTrack?.let { peer?.addTrack(it, listOf(STREAM_ID)) }
-
-        // Actualizar referencias a senders actuales
-        videoSender = ensureVideoSender()
-        audioSender = peer?.senders?.firstOrNull { it.track()?.kind() == "audio" }
-    }
-
-    /** Expuesto para que MainActivity/Signaling llamen ante reconexión WS */
-    fun resetPeer() = createOrResetPeer()
-
-    /** Encuentra un sender de video válido en el peer actual. */
-    private fun ensureVideoSender(): RtpSender? {
-        val s = peer?.senders?.firstOrNull { it.track()?.kind() == "video" }
-        if (s != null) return s
-        // Si no lo encuentra, intentá añadir el track actual
-        return videoTrack?.let { tr -> peer?.addTrack(tr, listOf(STREAM_ID)) }
     }
 }
