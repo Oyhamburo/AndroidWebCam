@@ -28,7 +28,7 @@ data class ConfigState(
     val aspect: String,
     val camera: String,           // "back" | "front"
     val cameraName: String?,      // deviceName exacto si viene
-    val iceServers: List<IceServer> // <— NUEVO
+    val iceServers: List<IceServer>
 )
 
 data class CamInfo(val name: String, val label: String, val facing: String)
@@ -62,27 +62,53 @@ class SignalingClient(
     var isConnected: Boolean = false
         private set
 
+    // --- Helpers ---
+    private fun isPlaceholderUrl(u: String?): Boolean {
+        if (u.isNullOrBlank()) return true
+        val v = u.trim()
+        if (v == "ws://0.0.0.0:9") return true
+        if (v.contains("://0.0.0.0")) return true
+        if (Regex(""":9/?$""").containsMatchIn(v)) return true
+        return false
+    }
+
     private fun post(block: () -> Unit) = main.post(block)
+
+    private fun optStringOrNull(obj: JSONObject, key: String): String? {
+        val s = obj.optString(key, "")
+        return if (s.isNotEmpty() && s.lowercase() != "null") s else null
+    }
+
+    private fun optStringOrNull(arr: JSONArray, index: Int): String? {
+        if (index < 0 || index >= arr.length()) return null
+        val s = arr.optString(index, "")
+        return if (s.isNotEmpty() && s.lowercase() != "null") s else null
+    }
 
     private fun parseIceServers(from: JSONObject): List<IceServer> {
         val arr = from.optJSONArray("iceServers") ?: return emptyList()
         val out = mutableListOf<IceServer>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val urlsJson = o.opt("urls")
-            val urls = when (urlsJson) {
-                is JSONArray -> (0 until urlsJson.length()).mapNotNull { urlsJson.optString(it, null) }.filter { it?.isNotBlank() == true }
-                is String -> listOf(urlsJson)
+            val urlsField = o.opt("urls")
+            val urls: List<String> = when (urlsField) {
+                is JSONArray -> buildList {
+                    for (j in 0 until urlsField.length()) {
+                        optStringOrNull(urlsField, j)?.let { add(it) }
+                    }
+                }
+                is String -> listOf(urlsField).filter { it.isNotBlank() }
                 else -> emptyList()
             }
             if (urls.isEmpty()) continue
-            val user = o.optString("username", null)?.takeIf { it.isNotEmpty() }
-            val cred = o.optString("credential", null)?.takeIf { it.isNotEmpty() }
+            val user = o.optString("username", "").takeIf { it.isNotEmpty() }
+            val cred = o.optString("credential", "").takeIf { it.isNotEmpty() }
             out += IceServer(urls = urls, username = user, credential = cred)
         }
         return out
     }
 
+    // --- WebSocket listener ---
     private val wsListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             isConnected = true
@@ -99,13 +125,19 @@ class SignalingClient(
                 return
             }
             when (msg.optString("type")) {
-                "browser-ready" -> { Log.d(TAG, "WS <- browser-ready"); post { onBrowserReady() } }
-                "answer" -> { Log.d(TAG, "WS <- answer (${text.length}b)"); post { onAnswer(msg.optString("sdp")) } }
+                "browser-ready" -> {
+                    Log.d(TAG, "WS <- browser-ready")
+                    post { onBrowserReady() }
+                }
+                "answer" -> {
+                    Log.d(TAG, "WS <- answer (${text.length}b)")
+                    post { onAnswer(msg.optString("sdp")) }
+                }
                 "ice" -> post {
                     onIceFromRemote(
                         RemoteIce(
-                            candidate = msg.optString("candidate"),
-                            sdpMid = msg.optString("sdpMid"),
+                            candidate = msg.optString("candidate", ""),
+                            sdpMid = optStringOrNull(msg, "sdpMid"),
                             sdpMLineIndex = msg.optInt("sdpMLineIndex")
                         )
                     )
@@ -119,14 +151,17 @@ class SignalingClient(
                         bitrateKbps  = msg.optInt("bitrateKbps", 6000),
                         aspect       = msg.optString("aspect", "AUTO_MAX"),
                         camera       = msg.optString("camera", "back"),
-                        cameraName   = msg.optString("cameraName", null)?.takeIf { it.isNotEmpty() && it != "null" },
+                        cameraName   = optStringOrNull(msg, "cameraName"),
                         iceServers   = parseIceServers(msg)
                     )
-                    Log.d(TAG, "WS <- config: width=${cfg.width} height=${cfg.height} fps=${cfg.fps} br=${cfg.bitrateKbps} ice=${cfg.iceServers.size}")
+                    Log.d(TAG, "WS <- config: ${cfg.width}x${cfg.height}@${cfg.fps} br=${cfg.bitrateKbps} ice=${cfg.iceServers.size}")
                     post { onConfig(cfg) }
                 }
-                "request-caps" -> { Log.d(TAG, "WS <- request-caps"); post { onRequestCaps() } }
-                "ping", "pong" -> {}
+                "request-caps" -> {
+                    Log.d(TAG, "WS <- request-caps")
+                    post { onRequestCaps() }
+                }
+                "ping", "pong" -> { /* noop */ }
                 else -> Log.d(TAG, "WS <- ${msg.optString("type")} (${text.length}b)")
             }
         }
@@ -147,12 +182,21 @@ class SignalingClient(
     }
 
     init {
-        if (autoConnect) connect()
+        if (autoConnect) {
+            connect()
+        }
     }
 
     @Synchronized
     fun connect() {
         cancelScheduledReconnect()
+
+        // ✅ Evita crash si la URL está vacía o es placeholder
+        if (isPlaceholderUrl(url)) {
+            Log.w(TAG, "WS CONNECT SKIPPED (url vacía/placeholder: '$url')")
+            return
+        }
+
         Log.i(TAG, "WS CONNECT -> $url")
         val req = Request.Builder().url(url).build()
         ws = try {
@@ -164,7 +208,7 @@ class SignalingClient(
     }
 
     fun updateUrl(newUrl: String, reconnect: Boolean = true) {
-        Log.i(TAG, "WS URL UPDATE $url -> $newUrl")
+        Log.i(TAG, "WS URL UPDATE $url -> $newUrl (reconnect=$reconnect)")
         url = newUrl
         if (reconnect) reconnectNow()
     }
@@ -173,12 +217,12 @@ class SignalingClient(
         Log.i(TAG, "WS RECONNECT NOW")
         reconnectAttempts = 0
         close()
-        connect()
+        connect() // connect() ya valida url y no crashea si está vacía
     }
 
     private fun scheduleReconnect() {
         reconnectAttempts += 1
-        val delay = kotlin.math.min(maxDelayMs, baseDelayMs * (1 shl (reconnectAttempts - 1)))
+        val delay = min(maxDelayMs, baseDelayMs * (1 shl (reconnectAttempts - 1)))
         Log.w(TAG, "WS RECONNECT in ${delay}ms (attempt #$reconnectAttempts)")
         post { onReconnecting(reconnectAttempts, delay) }
         cancelScheduledReconnect()
@@ -202,7 +246,16 @@ class SignalingClient(
     }
 
     fun sendIce(candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
-        send(JSONObject(mapOf("type" to "ice", "candidate" to candidate, "sdpMid" to sdpMid, "sdpMLineIndex" to sdpMLineIndex)))
+        send(
+            JSONObject(
+                mapOf(
+                    "type" to "ice",
+                    "candidate" to candidate,
+                    "sdpMid" to (sdpMid ?: JSONObject.NULL),
+                    "sdpMLineIndex" to sdpMLineIndex
+                )
+            )
+        )
     }
 
     fun ping() = send(JSONObject(mapOf("type" to "ping")))
@@ -214,21 +267,32 @@ class SignalingClient(
     ) {
         val camsJson = JSONArray().apply {
             cameras.forEach { c ->
-                put(JSONObject().apply {
-                    put("name", c.name); put("label", c.label); put("facing", c.facing)
-                })
+                put(
+                    JSONObject().apply {
+                        put("name", c.name)
+                        put("label", c.label)
+                        put("facing", c.facing)
+                    }
+                )
             }
         }
 
         val formatsJson = JSONObject().apply {
             formatsByCameraName.forEach { (camName, list) ->
-                put(camName, JSONArray().apply {
-                    list.forEach { f ->
-                        put(JSONObject().apply {
-                            put("w", f.w); put("h", f.h); put("fps", JSONArray(f.fps))
-                        })
+                put(
+                    camName,
+                    JSONArray().apply {
+                        list.forEach { f ->
+                            put(
+                                JSONObject().apply {
+                                    put("w", f.w)
+                                    put("h", f.h)
+                                    put("fps", JSONArray(f.fps))
+                                }
+                            )
+                        }
                     }
-                })
+                )
             }
         }
 
@@ -243,13 +307,13 @@ class SignalingClient(
     }
 
     private fun send(obj: JSONObject) {
-        val s = obj.toString()
         val socket = ws
         if (socket == null) {
-            Log.w(TAG, "WS SEND skip (socket null): ${s.take(120)}")
+            Log.w(TAG, "WS SEND skip (socket null): ${obj.optString("type")} ${obj.toString().take(120)}")
             return
         }
         try {
+            val s = obj.toString()
             socket.send(s)
             Log.v(TAG, "WS -> ${obj.optString("type")} (${s.length}b)")
         } catch (t: Throwable) {
